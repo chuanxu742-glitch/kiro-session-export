@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Kiro Session Manager & Markdown Converter  (v1.0)
+Kiro Session Manager & Markdown / JSON Exporter
 -------------------------------------------------
 An interactive tool to browse, filter, and convert Kiro IDE chat
 sessions into readable Markdown documents.
@@ -13,8 +13,12 @@ Kiro storage layout (as of this script being written):
     <workspace-hash>/<bucket>/<execution-hash>   ← execution records (the gold)
 
 The execution records hold the actual tool calls, assistant 'say'
-messages, reasoning, summarizations (compaction), errors, etc.  This
+messages, reasoning, summarizations (compaction), errors, etc. This
 script joins them with each session and renders rich Markdown.
+
+Modern IDE sessions use ~/.kiro/sessions/<workspace-hash>/<session-id>/
+with session.json metadata and messages.jsonl envelopes containing
+{id, timestamp, payload}. Both IDE layouts are read without migration.
 
 Compaction handling:
   • Sessions whose first hidden user message starts with
@@ -36,6 +40,18 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Set, Iterable
+
+from kiro_export.sections import (SECTION_DEFS, ALL_SECTION_KEYS, ACTION_TYPE_TO_SECTION,
+    FILTER_PRESETS, ORCH_STATUSES, ORCH_LAYERS, ORCH_HEAVY_LAYERS, DEFAULT_OUTPUT_CAP, CAP_STEPS)
+from kiro_export.options import ExportOptions
+from kiro_export.preferences import load_preferences, save_preferences
+from kiro_export.exporting import (
+    RenderContext, cap_text, default_orch_filter, _json_value, _nested_events,
+    _session_read_error_count, _auxiliary_export_counts, _json_export_info,
+    render_markdown as _render_markdown, serialize_sessions_json as _serialize_sessions_json,
+)
+
+_REUSE_EXPORT_SETTINGS = False
 
 # Platform-specific terminal handling
 _IS_WINDOWS = sys.platform == 'win32'
@@ -118,6 +134,8 @@ def default_kiro_cli_sessions_dir() -> Path:
 KIRO_HOME = default_kiro_home()
 WORKSPACE_SESSIONS_DIR = KIRO_HOME / "workspace-sessions"
 KIRO_CLI_SESSIONS_DIR = default_kiro_cli_sessions_dir()
+KIRO_IDE_SESSIONS_DIR = Path(os.environ.get('KIRO_IDE_SESSIONS_DIR') or
+                             Path.home() / '.kiro' / 'sessions').expanduser()
 
 # ──────────────────────────────────────────────────────────────
 # JSON fast path — use orjson if installed (3-5× faster than stdlib).
@@ -138,87 +156,6 @@ except ImportError:
 # No persistent cache: every run reads live data from Kiro's storage.
 # Speedups come from reading less per file (head-only previews,
 # single-pass regex metadata) and from parallel IO/parsing.
-
-# ──────────────────────────────────────────────────────────────
-# Section Definitions  (key, display_name, emoji, default_on)
-# ──────────────────────────────────────────────────────────────
-SECTION_DEFS = [
-    ('user_message',     'User Messages',       '👤', True ),
-    ('agent_message',    'Agent Messages',      '🤖', True ),
-    ('reasoning',        'Agent Reasoning',     '🧠', False),
-    ('file_read',        'File Reads',          '📖', False),
-    ('file_create',      'File Creates',        '🆕', True ),
-    ('file_edit',        'File Edits',          '✏️ ', True ),
-    ('file_delete',      'File Deletes',        '🗑️ ', True ),
-    ('terminal_cmd',     'Terminal Commands',   '💻', True ),
-    ('terminal_output',  'Terminal Outputs',    '📤', True ),
-    ('process_ctrl',     'Process Control',     '⚙️ ', True ),
-    ('code_search',      'Code Search',         '🔎', False),
-    ('diagnostics',      'Diagnostics',         '🩺', False),
-    ('web_search',       'Web Searches',        '🌐', False),
-    ('web_fetch',        'Web Fetches',         '🔗', False),
-    ('mcp_tool',         'MCP Calls',           '🔌', False),
-    ('sub_agent',        'Sub-Agent Calls',     '🧩', True ),
-    ('orchestration',    'Orchestrations',      '🎭', True ),
-    ('summarization',    'Compaction Summary',  '✂️ ', True ),
-    ('intent',           'Intent Classification','🎯', False),
-    ('error',            'Errors',              '❗', False),
-    ('user_input',       'Clarifying Q&A',      '❓', False),
-    ('session_event',    'Session Events',      '🔔', True ),
-    ('session_meta',     'Session Metadata',    '📝', True ),
-]
-ALL_SECTION_KEYS = {s[0] for s in SECTION_DEFS}
-
-# Mapping from Kiro actionType → our section key
-ACTION_TYPE_TO_SECTION: Dict[str, str] = {
-    'say':                'agent_message',
-    'reasoning':          'reasoning',
-    'readFile':           'file_read',
-    'readFiles':          'file_read',
-    'readCode':           'file_read',
-    'read_file':          'file_read',
-    'create':             'file_create',
-    'write':              'file_create',
-    'replace':            'file_edit',
-    'append':             'file_edit',
-    'str_replace':        'file_edit',
-    'delete':             'file_delete',
-    'runCommand':         'terminal_cmd',
-    'execute_pwsh':       'terminal_cmd',
-    'controlProcess':     'process_ctrl',
-    'getProcessOutput':   'process_ctrl',
-    'search':             'code_search',
-    'file_search':        'code_search',
-    'getDiagnostics':     'diagnostics',
-    'remote_web_search':  'web_search',
-    'webFetch':           'web_fetch',
-    'mcp':                'mcp_tool',
-    'invokeSubAgent':     'sub_agent',
-    'subagent_response':  'sub_agent',
-    'subagentResponse':   'sub_agent',
-    'specAgent':          'sub_agent',
-    'summarization':      'summarization',
-    'intentClassification':'intent',
-    'displayError':       'error',
-    'userInput':          'user_input',
-    'analyzeRequirements':'sub_agent',
-    'model':              None,   # internal book-keeping — drop
-}
-
-# ──────────────────────────────────────────────────────────────
-# Filter Presets  (name, enabled_keys | None=defaults, clean)
-# ──────────────────────────────────────────────────────────────
-FILTER_PRESETS = [
-    ('Defaults',        None, False),
-    ('Chat Only',       {'user_message','agent_message','session_meta','session_event'}, False),
-    ('Chat + Reasoning',{'user_message','agent_message','reasoning','session_meta','session_event'}, False),
-    ('Chat + Terminal', {'user_message','agent_message','terminal_cmd','terminal_output',
-                          'process_ctrl','session_meta','session_event'}, False),
-    ('Code Activity',   {'user_message','agent_message','file_read','file_create','file_edit',
-                          'file_delete','terminal_cmd','terminal_output','session_meta','session_event'}, False),
-    ('Outputs Only',    {'terminal_output'}, False),
-    ('Full Export',     ALL_SECTION_KEYS, False),
-]
 
 # ──────────────────────────────────────────────────────────────
 # Utility helpers
@@ -891,7 +828,7 @@ class SessionEntry:
             return 0
 
 
-def scan_all_sessions() -> List[SessionEntry]:
+def _scan_legacy_sessions() -> List[SessionEntry]:
     """Read every workspace-sessions/<b64>/sessions.json and return all entries."""
     sessions: List[SessionEntry] = []
     if not WORKSPACE_SESSIONS_DIR.exists():
@@ -930,6 +867,121 @@ def scan_all_sessions() -> List[SessionEntry]:
     # newest first
     sessions.sort(key=lambda s: s.date_created, reverse=True)
     return sessions
+
+
+def _iter_ide_messages(path: Path) -> Iterable[Dict]:
+    """Read the IDE JSONL envelope; surface damaged records without losing later ones."""
+    try:
+        with path.open('r', encoding='utf-8') as stream:
+            for number, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                    if not isinstance(record, dict) or not isinstance(record.get('payload'), dict):
+                        raise ValueError('expected a record with a payload object')
+                    yield record
+                except (ValueError, TypeError) as error:
+                    yield {'payload': {'type': 'parse_error',
+                                      'content': f'{path.name}, line {number}: {error}'}}
+    except (OSError, UnicodeError) as error:
+        yield {'payload': {'type': 'parse_error', 'content': f'Cannot read {path}: {error}'}}
+
+
+class ModernSessionEntry(SessionEntry):
+    """IDE metadata in sessions/<workspace-hash>/<session-id>/session.json."""
+    @property
+    def messages_file(self) -> Path:
+        return self.session_file.with_name('messages.jsonl')
+
+    @property
+    def size(self) -> int:
+        try:
+            return super().size + self.messages_file.stat().st_size
+        except OSError:
+            return super().size
+
+    def load_preview(self, head_bytes: int = 512 * 1024):
+        if self._preview_loaded:
+            return
+        self._preview_loaded = True
+        consumed = 0
+        for record in _iter_ide_messages(self.messages_file):
+            payload = record['payload']
+            text = msg_text(payload.get('content'))
+            if payload.get('type') == 'user' and text.strip():
+                self._preview_first_user = normalize_title_candidate(text)
+                return
+            consumed += len(text.encode('utf-8'))
+            if consumed >= head_bytes:
+                return
+
+
+def scan_all_sessions() -> List[SessionEntry]:
+    """Combine both IDE layouts; migrated session IDs use the modern copy."""
+    by_id = {entry.session_id: entry for entry in _scan_legacy_sessions()}
+    for path in KIRO_IDE_SESSIONS_DIR.glob('*/*/session.json'):
+        try:
+            data = _json_load_path(path)
+            if not isinstance(data, dict) or not isinstance(data.get('id'), str) or not data['id']:
+                continue
+            workspaces = data.get('workspacePaths') or data.get('rootPaths') or []
+            workspace = next((p for p in workspaces if isinstance(p, str)), '')
+            entry = ModernSessionEntry(
+                sid=data['id'], title=data.get('title') or '',
+                date_ms=parse_iso_datetime_ms(data.get('createdAt')) or int(path.stat().st_mtime * 1000),
+                ws_dir=workspace, hidden=data.get('hidden', False), session_file=path,
+                ws_b64=path.parent.parent.name,
+            )
+            by_id[entry.session_id] = entry
+        except (OSError, ValueError, TypeError):
+            continue
+    return sorted(by_id.values(), key=lambda entry: entry.date_created, reverse=True)
+
+
+def _modern_tool_item(payload: Dict) -> Dict:
+    """Translate modern tool arguments into the existing Markdown section fields."""
+    name = payload.get('toolName') or payload.get('actionType') or 'unknown'
+    action = payload.get('actionType') or name
+    args = payload.get('args') or {}
+    if not isinstance(args, dict):
+        args = {'input': args}
+    section = {
+        'read_file': 'file_read', 'read_files': 'file_read', 'read_code': 'file_read',
+        'fs_write': 'file_create', 'fs_append': 'file_edit', 'str_replace': 'file_edit',
+        'delete_file': 'file_delete', 'execute_pwsh': 'terminal_cmd',
+        'execute_bash': 'terminal_cmd', 'run_command': 'terminal_cmd',
+        'control_pwsh_process': 'process_ctrl', 'control_process': 'process_ctrl',
+        'get_process_output': 'process_ctrl', 'list_processes': 'process_ctrl',
+        'grep_search': 'code_search', 'list_directory': 'code_search',
+        'file_search': 'code_search', 'web_fetch': 'web_fetch',
+    }.get(name) or ACTION_TYPE_TO_SECTION.get(action) or 'session_event'
+    item = {'type': section, 'tool': name, 'state': payload.get('status') or 'Pending',
+            'execution_id': payload.get('executionId'), 'arguments': args}
+    why = args.get('explanation') or args.get('description') or ''
+    path = args.get('path') or args.get('file') or args.get('targetFile') or ''
+    if section == 'file_read':
+        files = args.get('files') or ([{'path': path}] if path else [])
+        item['files'] = [f if isinstance(f, dict) else {'path': str(f)} for f in files]
+    elif section in ('file_create', 'file_edit', 'file_delete'):
+        item.update(path=path, explanation=why,
+                    original_content=args.get('oldStr') or args.get('originalContent') or '',
+                    modified_content=args.get('newStr') or args.get('text') or args.get('content') or '')
+    elif section in ('terminal_cmd', 'process_ctrl'):
+        item.update(command=args.get('command') or '', cwd=args.get('cwd') or '',
+                    explanation=why, summary=args.get('action') or args.get('terminalId') or '')
+    elif section == 'code_search':
+        item.update(query=args.get('query') or path, why=why)
+    elif section == 'web_search':
+        item['query'] = args.get('query') or ''
+    elif section == 'web_fetch':
+        item['url'] = args.get('url') or ''
+    elif section == 'mcp_tool':
+        item.update(server=args.get('serverName') or '', tool_name=args.get('toolName') or name,
+                    arguments=args.get('toolArgs') or args)
+    else:
+        item.update(event=name, content=f'Tool {name}: {json.dumps(args, ensure_ascii=False)}')
+    return item
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1155,9 +1207,107 @@ def scan_cli_sessions(id_query: str = '') -> List[CliSessionEntry]:
 # ──────────────────────────────────────────────────────────────
 # Session parser — joins shell-history with execution records
 # ──────────────────────────────────────────────────────────────
-class SessionParser:
-    def __init__(self, entry: SessionEntry):
+def _session_auxiliary_path(base: Path, directory: str, name: str) -> Path:
+    """Resolve only a direct file inside this session, including after relocation."""
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+', name) or name in ('.', '..'):
+        raise ValueError('invalid auxiliary filename')
+    root = base.resolve() / directory
+    target = (root / name).resolve()
+    if target.parent != root:
+        raise ValueError('auxiliary file resolves outside its session directory')
+    return target
+
+
+def _expand_ide_tool_output(base: Path, recorded: str) -> Tuple[str, List[Dict], List[str]]:
+    """Recover Kiro's spill-file notices; unrelated paths in tool text are not read."""
+    pattern = r'''(?:The full output was saved to a file under\s+|<file\s+name=)(['"])([^'"\r\n]+)\1'''
+    outputs, bodies, errors = [], [], []
+    seen = set()
+    for match in re.finditer(pattern, recorded):
+        reference = match.group(2).replace('\\', '/')
+        if '/tool-outputs/' in reference:
+            name = reference.rsplit('/tool-outputs/', 1)[1]
+        elif reference.startswith('tool-outputs/'):
+            name = reference[len('tool-outputs/'):]
+        else:
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        item = {'file': f'tool-outputs/{name}', 'status': 'loaded'}
+        try:
+            path = _session_auxiliary_path(base, 'tool-outputs', name)
+            bodies.append(path.read_bytes().decode('utf-8'))
+        except (OSError, UnicodeError, ValueError, RuntimeError) as error:
+            item['status'] = 'missing' if isinstance(error, FileNotFoundError) else 'unreadable'
+            errors.append(f"Cannot load {item['file']}: {type(error).__name__}")
+        outputs.append(item)
+    # Keep the original notice when any referenced body is unavailable.
+    if errors and bodies:
+        bodies.insert(0, recorded)
+    return ('\n\n'.join(bodies) if bodies else recorded), outputs, errors
+
+
+class SessionExportMixin:
+    """Shared operations on normalized IDE and CLI transcripts."""
+
+    def get_turn_boundaries(self) -> List[int]:
+        return turn_boundaries(self.data)
+
+    def get_turn_count(self) -> int:
+        return len(self.get_turn_boundaries())
+
+    def trim_to_last_n_turns(self, n: int):
+        """Keep the last N user turns and the agent work that followed each.
+
+        A session that continued from a compaction summary keeps that opening
+        summary, so the trimmed export still has its setup.
+        """
+        apply_extraction_scope(self, _last_scope(n) if n > 0 else _full_scope())
+
+    def trim_to_live_context(self):
+        """Keep the transcript from the latest compaction forward."""
+        apply_extraction_scope(self, _live_scope())
+
+    def count_lines_by_section(self) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for it in self.data:
+            t = it['type']
+            counts[t] = counts.get(t, 0) + estimate_lines(it)
+        if self.metadata:
+            counts['session_meta'] = counts.get('session_meta', 0) + 7
+        return counts
+
+    def to_json(self, section_filter: Optional[Dict[str, bool]] = None,
+                clean_content: bool = False, output_cap: int = 0,
+                user_cap: int = 0, agent_cap: int = 0, reasoning_cap: int = 0,
+                summary_cap: int = 0, orch_filter: Optional[Dict] = None) -> str:
+        """Serialize selected events as a versioned JSON document with a sessions array."""
+        return serialize_sessions_json(
+            [self], section_filter, clean_content, output_cap,
+            user_cap, agent_cap, reasoning_cap, summary_cap, orch_filter,
+        )
+
+    def to_markdown(self, section_filter: Optional[Dict[str, bool]] = None,
+                    clean_content: bool = False,
+                    output_cap: int = 0,
+                    user_cap: int = 0,
+                    agent_cap: int = 0,
+                    reasoning_cap: int = 0,
+                    summary_cap: int = 0,
+                    orch_filter: Optional[Dict] = None) -> str:
+        options = _render_options(section_filter, clean_content, output_cap, user_cap,
+                                  agent_cap, reasoning_cap, summary_cap, orch_filter)
+        return _render_markdown(self, options, _render_context())
+
+
+class SessionParser(SessionExportMixin):
+    def __init__(self, entry: SessionEntry, _messages_file: Optional[Path] = None,
+                 _visited_sub_executions: Optional[Set[str]] = None):
         self.entry = entry
+        self._messages_file = _messages_file
+        self._visited_sub_executions = (_visited_sub_executions
+                                        if _visited_sub_executions is not None else set())
         self.session_id = entry.session_id
         self.workspace_dir = entry.workspace_dir
         self.title = entry.title or "Untitled Session"
@@ -1188,6 +1338,9 @@ class SessionParser:
 
     # ------------------------------------------------------------
     def _load(self):
+        if isinstance(self.entry, ModernSessionEntry):
+            self._load_modern()
+            return
         try:
             shell = _json_load_path(self.entry.session_file)
         except Exception:
@@ -1355,6 +1508,141 @@ class SessionParser:
             self.title = cand
         else:
             self.title = stripped
+
+    def _load_modern(self):
+        """Read append-only IDE records, preserving call/result positions in the transcript."""
+        shell = _json_load_path(self.entry.session_file)
+        self.metadata = {'sessionId': self.session_id, 'title': self.title,
+                         'workspacePath': self.workspace_dir, 'source': 'Kiro IDE',
+                         'schemaVersion': shell.get('schemaVersion')}
+        for key in ('dataModelVersion', 'workspacePaths', 'rootPaths', 'createdAt',
+                    'lastModifiedAt', 'modelId', 'agentMode', 'autopilot', 'hidden'):
+            if key in shell:
+                self.metadata[key] = shell[key]
+        self.session_type = shell.get('agentMode') or 'Kiro IDE'
+        self.autonomy_mode = 'Autopilot' if shell.get('autopilot') else 'Supervised'
+        if shell.get('modelId'):
+            self.model_titles.add(str(shell['modelId']))
+        pending_tools: Dict[str, Dict] = {}
+        pending_questions: Dict[Tuple, Dict] = {}
+        executions: Set[str] = set()
+        for record in _iter_ide_messages(self._messages_file or self.entry.messages_file):
+            payload = record['payload']
+            kind = payload.get('type')
+            content = msg_text(payload.get('content'))
+            execution = payload.get('executionId') or payload.get('parentExecutionId')
+            if execution:
+                executions.add(execution)
+            common = {'ts': record.get('timestamp'), 'execution_id': execution,
+                      'message_id': record.get('id'), 'record_type': kind}
+            if payload.get('toolCallId') is not None:
+                common['tool_call_id'] = payload['toolCallId']
+            if kind == 'user':
+                for image in payload.get('images') or []:
+                    content += '\n' + _image_note(image)
+                self.user_turn_count += 1
+                self.data.append(dict(common, type='user_message', content=content, hidden=False))
+            elif kind == 'assistant':
+                operation = payload.get('operationType') or 'Say'
+                section = {'Reasoning': 'reasoning', 'Summary': 'summarization'}.get(operation, 'agent_message')
+                if section == 'summarization':
+                    self.compaction_count += 1
+                    self.summaries.append(content)
+                    self.data.append(dict(common, type='session_event', event='context_compacted',
+                                          content='Context compacted into summary'))
+                self.data.append(dict(common, type=section, content=content))
+            elif kind == 'tool_call':
+                item = dict(common, **_modern_tool_item(payload))
+                self.data.append(item)
+                pending_tools[payload.get('toolCallId')] = item
+            elif kind == 'tool_result':
+                call = pending_tools.pop(payload.get('toolCallId'), None)
+                state = 'Failed' if payload.get('success') is False else 'Success'
+                section = call['type'] if call else 'session_event'
+                if call:
+                    call['state'] = state
+                # Results remain at their own record positions, even when tools overlap.
+                output, external_outputs, read_errors = _expand_ide_tool_output(
+                    self.entry.session_file.parent, content)
+                result = dict(common, type='terminal_output' if section == 'terminal_cmd' else section,
+                                      tool=call.get('tool', 'unknown') if call else 'unknown',
+                                      result_only=True, output=output, state=state,
+                                      success=payload.get('success'))
+                if external_outputs:
+                    result.update(recorded_output=content, external_outputs=external_outputs)
+                self.data.append(result)
+                for error in read_errors:
+                    self.data.append({'type': 'error', 'kind': 'session_read', 'message': error,
+                                      'tool_call_id': payload.get('toolCallId')})
+            elif kind == 'session_metadata':
+                key, value = payload.get('key'), payload.get('value')
+                if key == 'contextUsage' and isinstance(value, dict):
+                    usage = value.get('usagePercentage')
+                    if isinstance(usage, (int, float)):
+                        self.context_usage_pct = float(usage)
+                elif key == 'displayError':
+                    self.data.append(dict(common, type='error', kind=key,
+                                          message=msg_text(value.get('message') if isinstance(value, dict) else value)))
+                else:
+                    self.data.append(dict(common, type='session_event', event=key,
+                                          content=f'{key}: {json.dumps(value, ensure_ascii=False)}'))
+            elif kind == 'usage_summary':
+                for usage in payload.get('promptTurnSummaries') or []:
+                    if isinstance(usage, dict) and usage.get('unit') == 'credit':
+                        self.credits_used += float(usage.get('usage') or 0)
+            elif kind == 'sub_agent_start':
+                self.data.append(dict(common, type='sub_agent', kind='invoke',
+                                      sub_session_id=payload.get('subSessionId'),
+                                      name=payload.get('subAgentName') or '', prompt=payload.get('prompt') or '',
+                                      explanation=payload.get('explanation') or ''))
+            elif kind == 'sub_agent_complete':
+                self.data.append(dict(common, type='sub_agent', kind='response',
+                                      sub_session_id=payload.get('subSessionId'),
+                                      response=msg_text(payload.get('response'))))
+            elif kind == 'pending_interaction':
+                question = {'question': msg_text(payload.get('question')), 'response': {}}
+                pending_questions[(payload.get('toolCallId'), payload.get('consentRound'))] = question
+                self.data.append(dict(common, type='user_input', questions=[question]))
+            elif kind == 'interaction_resolved':
+                question = pending_questions.get((payload.get('toolCallId'), payload.get('consentRound')))
+                if question:
+                    question['response'] = {'answer': msg_text(payload.get('selectedOption') or payload.get('outcome'))}
+            elif kind == 'parse_error':
+                self.data.append(dict(common, type='error', kind='session_read', message=content))
+            elif kind not in ('turn_start', 'turn_end'):
+                self.data.append(dict(common, type='session_event', event=kind,
+                                      content=content or json.dumps(payload, ensure_ascii=False)))
+        self.execution_count = len(executions)
+        self._load_sub_executions()
+
+    def _load_sub_executions(self):
+        """Attach each child stream once, at its completion or its unfinished invocation."""
+        hosts = {item['sub_session_id']: item for item in self.data
+                 if item.get('type') == 'sub_agent' and item.get('sub_session_id')}
+        for sid, host in hosts.items():
+            child = {'id': sid, 'events': []}
+            host['sub_execution'] = child
+            try:
+                path = _session_auxiliary_path(self.entry.session_file.parent, 'sub-executions', f'{sid}.jsonl')
+                key = str(path)
+                if key in self._visited_sub_executions:
+                    child['status'] = 'already_included'
+                    continue
+                self._visited_sub_executions.add(key)
+                if not path.is_file():
+                    raise FileNotFoundError()
+                parser = SessionParser(self.entry, _messages_file=path,
+                                       _visited_sub_executions=self._visited_sub_executions)
+                child.update(status='loaded', events=parser.data)
+            except (OSError, ValueError, RuntimeError) as error:
+                child.update(status='unreadable', events=[{
+                    'type': 'error', 'kind': 'session_read',
+                    'message': f'Cannot load sub-execution: {type(error).__name__}',
+                }])
+        if self._messages_file is None:
+            files = (self.entry.session_file.parent / 'sub-executions').glob('*.jsonl')
+            self.unlinked_sub_execution_count = sum(str(path.resolve()) not in self._visited_sub_executions
+                                                     for path in files)
 
     # ------------------------------------------------------------
     def _absorb_execution(self, fp: Path, prefetched: Optional[Dict] = None, mark_extra: bool = False):
@@ -1787,388 +2075,18 @@ class SessionParser:
             })
 
     # ------------------------------------------------------------
-    def get_turn_boundaries(self) -> List[int]:
-        return turn_boundaries(self.data)
 
-    def get_turn_count(self) -> int:
-        return len(self.get_turn_boundaries())
 
-    def trim_to_last_n_turns(self, n: int):
-        """Keep the last N user turns and the agent work that followed each.
 
-        A session that continued from a compaction summary keeps that opening
-        summary, so the trimmed export still has its setup.
-        """
-        apply_extraction_scope(self, _last_scope(n) if n > 0 else _full_scope())
-
-    def trim_to_live_context(self):
-        """Keep the transcript from the latest compaction forward."""
-        apply_extraction_scope(self, _live_scope())
 
     # ------------------------------------------------------------
-    def count_lines_by_section(self) -> Dict[str, int]:
-        counts: Dict[str, int] = {}
-        for it in self.data:
-            t = it['type']
-            counts[t] = counts.get(t, 0) + estimate_lines(it)
-        if self.metadata:
-            counts['session_meta'] = counts.get('session_meta', 0) + 7
-        return counts
 
     # ------------------------------------------------------------
-    def to_markdown(self, section_filter: Optional[Dict[str, bool]] = None,
-                    clean_content: bool = False,
-                    output_cap: int = 0,
-                    user_cap: int = 0,
-                    agent_cap: int = 0,
-                    reasoning_cap: int = 0,
-                    summary_cap: int = 0,
-                    orch_filter: Optional[Dict] = None) -> str:
-        if section_filter is None:
-            section_filter = {s[0]: True for s in SECTION_DEFS}
-        if orch_filter is None:
-            orch_filter = default_orch_filter()
 
-        def _cap_text(text: str, cap: int = 0) -> str:
-            c = cap if cap > 0 else output_cap
-            if c <= 0 or not text:
-                return text
-            lines = text.split('\n')
-            if len(lines) <= c:
-                return text
-            kept = lines[-c:]
-            return f'... ({len(lines) - c} lines trimmed) ...\n' + '\n'.join(kept)
-
-        # Per-type "last N" caps (counted from the tail)
-        keep_indices = set(range(len(self.data)))
-        caps = {
-            'user_message': user_cap,
-            'agent_message': agent_cap,
-            'reasoning': reasoning_cap,
-            'summarization': summary_cap,
-        }
-        counters = {k: 0 for k in caps}
-        for i in range(len(self.data) - 1, -1, -1):
-            t = self.data[i]['type']
-            if t in caps and caps[t] > 0:
-                if counters[t] >= caps[t]:
-                    keep_indices.discard(i)
-                counters[t] += 1
-
-        md: List[str] = []
-
-        # Header — title and compaction badges
-        badge_bits = []
-        if self.started_from_compaction:
-            badge_bits.append('↻ from compaction')
-        if self.compaction_count:
-            badge_bits.append(f'✂ compacted ×{self.compaction_count}')
-        if self.continuation_count:
-            badge_bits.append(f'↪ continued ×{self.continuation_count}')
-        if self.hidden:
-            badge_bits.append('hidden')
-        badges = '  '.join(badge_bits)
-        title_line = f"# {self.title}"
-        if badges:
-            title_line += f"   _({badges})_"
-        md.append(title_line + '\n')
-
-        if section_filter.get('session_meta', False):
-            md.append('```yaml')
-            md.append(f"Session ID:   {self.session_id}")
-            md.append(f"Workspace:    {self.workspace_dir or '?'}")
-            if self.date_created:
-                try:
-                    dt = datetime.fromtimestamp(self.date_created / 1000.0).strftime('%Y-%m-%d %H:%M:%S')
-                except Exception:
-                    dt = str(self.date_created)
-                md.append(f"Created:      {dt}")
-            if self.model_titles:
-                md.append(f"Model(s):     {', '.join(sorted(self.model_titles))}")
-            if self.autonomy_mode:
-                md.append(f"Autonomy:     {self.autonomy_mode}")
-            if self.session_type:
-                md.append(f"Session type: {self.session_type}")
-            md.append(f"Executions:   {self.execution_count}")
-            md.append(f"User turns:   {self.user_turn_count}")
-            if self.context_usage_pct:
-                md.append(f"Context:      {self.context_usage_pct:.1f}%")
-            if self.credits_used:
-                md.append(f"Credits:      {self.credits_used:.4f}")
-            if self.parent_session_ids:
-                md.append(f"Parents:      {len(self.parent_session_ids)} ancestor session(s)")
-            md.append('```\n')
-
-        last_rendered_msg = None
-        for i, item in enumerate(self.data):
-            if i not in keep_indices:
-                continue
-            t = item['type']
-            if not section_filter.get(t, False):
-                continue
-
-            if t == 'user_message':
-                content = item.get('content', '')
-                if clean_content:
-                    content = strip_ide_context(content)
-                    if not content.strip():
-                        continue
-                    key = ('user', content)
-                    if key == last_rendered_msg:
-                        continue
-                    last_rendered_msg = key
-                md.append(f"## 👤 User\n\n{content}\n")
-
-            elif t == 'agent_message':
-                content = item.get('content', '').strip()
-                if not content:
-                    continue
-                if clean_content:
-                    key = ('agent', content)
-                    if key == last_rendered_msg:
-                        continue
-                    last_rendered_msg = key
-                md.append(f"## 🤖 Agent\n\n{content}\n")
-
-            elif t == 'reasoning':
-                content = item.get('content', '').strip()
-                if not content:
-                    continue
-                md.append(f"> 🧠 **Reasoning**\n>\n> " + content.replace('\n', '\n> ') + "\n")
-
-            elif t == 'summarization':
-                content = item.get('content', '').strip()
-                if not content:
-                    continue
-                where = item.get('where', 'inline')
-                heading = '## ✂️ Compaction Summary (intro)' if where == 'intro' else '## ✂️ Compaction Summary'
-                md.append(f"{heading}\n\n{content}\n")
-
-            elif t == 'file_read':
-                files = item.get('files') or []
-                err = item.get('error')
-                tool = item.get('tool', 'readFile')
-                state = item.get('state', '')
-                if files:
-                    bullets = []
-                    for f in files:
-                        line = f.get('path', '?')
-                        if f.get('start') is not None and f.get('end') is not None:
-                            line += f"  [{f['start']}–{f['end']}]"
-                        bullets.append(f"- `{line}`")
-                    head = f"### 📖 Read ({tool})"
-                    if err:
-                        head += f"  *— failed: {err.splitlines()[0][:80]}*"
-                    md.append(head + "\n\n" + "\n".join(bullets) + "\n")
-                out = item.get('output', '')
-                if isinstance(out, str) and out.strip():
-                    out = _cap_text(out)
-                    md.append(f"```text\n{out}\n```\n")
-
-            elif t == 'file_create':
-                path = item.get('path', '?')
-                content = item.get('modified_content') or ''
-                why = item.get('explanation') or ''
-                state = item.get('state', '')
-                err = item.get('error')
-                head = f"### 🆕 Create `{path}`"
-                if err:
-                    head += f"  *— failed: {err.splitlines()[0][:80]}*"
-                if state and state not in ('Accepted', 'Success'):
-                    head += f"  *— {state}*"
-                md.append(head)
-                if why:
-                    md.append(f"\n> {why}\n")
-                if isinstance(content, str) and content:
-                    lang = guess_lang(path)
-                    md.append(f"\n```{lang}\n{_cap_text(content)}\n```\n")
-
-            elif t == 'file_edit':
-                path = item.get('path', '?')
-                why = item.get('explanation') or ''
-                state = item.get('state', '')
-                tool = item.get('tool', 'edit')
-                orig = item.get('original_content') or ''
-                modf = item.get('modified_content') or ''
-                err = item.get('error')
-                head = f"### ✏️ Edit `{path}`  *(via {tool})*"
-                if err:
-                    head += f"  *— failed: {err.splitlines()[0][:80]}*"
-                if state and state not in ('Accepted', 'Success'):
-                    head += f"  *— {state}*"
-                md.append(head)
-                if why:
-                    md.append(f"\n> {why}\n")
-                # Render a compact diff when both sides exist
-                if isinstance(modf, str) and modf:
-                    lang = guess_lang(path)
-                    md.append(f"\n**Modified:**\n\n```{lang}\n{_cap_text(modf)}\n```\n")
-                elif isinstance(orig, str) and orig:
-                    md.append(f"\n_(modified content omitted)_\n")
-
-            elif t == 'file_delete':
-                path = item.get('path', '?')
-                why = item.get('explanation') or ''
-                state = item.get('state', '')
-                err = item.get('error')
-                head = f"### 🗑️ Delete `{path}`"
-                if err:
-                    head += f"  *— failed: {err.splitlines()[0][:80]}*"
-                elif state and state not in ('Accepted', 'Success'):
-                    head += f"  *— {state}*"
-                md.append(head + ("\n\n> " + why + "\n" if why else "\n"))
-
-            elif t == 'terminal_cmd':
-                cmd = item.get('command', '')
-                cwd = item.get('cwd', '')
-                why = item.get('explanation', '')
-                tool = item.get('tool', 'runCommand')
-                state = item.get('state', '')
-                err = item.get('error')
-                head = f"### 💻 {tool}"
-                if state and state not in ('Accepted', 'Success'):
-                    head += f"  *({state})*"
-                if err:
-                    head += f"  *— failed: {err.splitlines()[0][:80]}*"
-                md.append(head)
-                if why:
-                    md.append(f"\n> {why}")
-                if cwd:
-                    md.append(f"\n> `cwd: {cwd}`")
-                md.append(f"\n```powershell\n{cmd}\n```\n" if _IS_WINDOWS else f"\n```bash\n{cmd}\n```\n")
-
-            elif t == 'terminal_output':
-                out = item.get('output', '')
-                ec = item.get('exit_code')
-                if not isinstance(out, str):
-                    out = json.dumps(out, ensure_ascii=False, indent=2)
-                trimmed = _cap_text(out)
-                head = "**Output:**"
-                if ec is not None:
-                    head += f"  *(exit {ec})*"
-                if trimmed.strip():
-                    md.append(f"{head}\n\n```text\n{trimmed}\n```\n")
-
-            elif t == 'process_ctrl':
-                tool = item.get('tool', '?')
-                summary = item.get('summary', '')
-                cmd = item.get('command', '')
-                out = item.get('output', '')
-                err = item.get('error')
-                head = f"### ⚙️ Process — `{tool}` {summary}"
-                if err:
-                    head += f"  *— failed: {err.splitlines()[0][:80]}*"
-                md.append(head)
-                if cmd:
-                    md.append(f"\n```text\n{cmd}\n```")
-                if isinstance(out, str) and out.strip():
-                    md.append(f"\n**Output:**\n\n```text\n{_cap_text(out)}\n```")
-                md.append('')
-
-            elif t == 'code_search':
-                q = item.get('query', '')
-                why = item.get('why', '')
-                out = item.get('output', '')
-                err = item.get('error')
-                head = f"### 🔎 Search: `{q}`"
-                if err:
-                    head += f"  *— failed: {err.splitlines()[0][:80]}*"
-                md.append(head)
-                if why:
-                    md.append(f"\n> {why}")
-                if isinstance(out, str) and out.strip():
-                    md.append(f"\n```text\n{_cap_text(out)}\n```")
-                md.append('')
-
-            elif t == 'diagnostics':
-                paths = item.get('paths') or []
-                ic = item.get('issue_count', 0)
-                md.append(f"> 🩺 **Diagnostics:** {len(paths)} file(s), {ic} issue(s)\n")
-
-            elif t == 'web_search':
-                q = item.get('query', '')
-                results = item.get('results') or []
-                md.append(f"### 🌐 Web Search: `{q}`")
-                bullets = []
-                for r in results[:10]:
-                    if isinstance(r, dict):
-                        bullets.append(f"- [{r.get('title','(no title)')}]({r.get('url','')})")
-                if bullets:
-                    md.append('\n' + '\n'.join(bullets))
-                md.append('')
-
-            elif t == 'web_fetch':
-                url = item.get('url', '')
-                content = item.get('content', '')
-                md.append(f"### 🔗 Web Fetch: <{url}>")
-                if isinstance(content, str) and content.strip():
-                    md.append(f"\n```text\n{_cap_text(content)}\n```")
-                md.append('')
-
-            elif t == 'mcp_tool':
-                server = item.get('server', '?')
-                tool = item.get('tool_name', '?')
-                args = item.get('arguments') or {}
-                resp = item.get('response', '')
-                md.append(f"### 🔌 MCP: `{server}::{tool}`")
-                if args:
-                    md.append(f"\n```json\n{json.dumps(args, indent=2, ensure_ascii=False)}\n```")
-                if isinstance(resp, str) and resp.strip():
-                    md.append(f"\n**Response:**\n\n```text\n{_cap_text(resp)}\n```")
-                md.append('')
-
-            elif t == 'orchestration':
-                heavy = None
-                if any((orch_filter.get('layers') or {}).get(key) for key in ORCH_HEAVY_LAYERS):
-                    heavy = load_orchestration_heavy(item, orch_filter, output_cap)
-                block = render_orchestration(item, orch_filter, output_cap, heavy)
-                if block.strip():
-                    md.append(block)
-
-            elif t == 'sub_agent':
-                kind = item.get('kind', '')
-                if kind == 'invoke':
-                    name = item.get('name', '')
-                    expl = item.get('explanation', '')
-                    prompt = item.get('prompt', '')
-                    md.append(f"### 🧩 Sub-Agent → `{name}`")
-                    if expl:
-                        md.append(f"\n> {expl}")
-                    if prompt:
-                        md.append(f"\n```text\n{_cap_text(prompt)}\n```")
-                    md.append('')
-                elif kind == 'response':
-                    resp = item.get('response', '')
-                    md.append(f"### 🧩 Sub-Agent Response\n\n{resp}\n")
-                elif kind == 'spec':
-                    md.append(f"> 🧩 **Spec Agent** invoked\n")
-                else:
-                    md.append(f"### 🧩 Sub-Agent: `{kind}`\n")
-
-            elif t == 'intent':
-                cls = item.get('classification', '?')
-                md.append(f"> 🎯 **Intent:** {cls}\n")
-
-            elif t == 'error':
-                msg = item.get('message', '')
-                k   = item.get('kind', '')
-                md.append(f"> ❗ **Error** ({k}): {msg}\n")
-
-            elif t == 'user_input':
-                qs = item.get('questions') or []
-                for q in qs:
-                    if isinstance(q, dict):
-                        question = q.get('question', '')
-                        ans = (q.get('response') or {}).get('answer') if isinstance(q.get('response'), dict) else ''
-                        md.append(f"> ❓ **Q:** {question}\n>\n> **A:** {ans}\n")
-
-            elif t == 'session_event':
-                md.append(f"> 🔔 **{item.get('content', item.get('event', ''))}**\n")
-
-        return "\n".join(md)
+    # ------------------------------------------------------------
 
 
-class CliSessionParser:
+class CliSessionParser(SessionExportMixin):
     """Parser for Kiro CLI session files.
 
     `<session>.json` is only a compact session index. The detailed transcript
@@ -2969,12 +2887,71 @@ class CliSessionParser:
             'execution_id': execution_id,
         }, execution_id)
 
-    get_turn_boundaries = SessionParser.get_turn_boundaries
-    get_turn_count = SessionParser.get_turn_count
-    trim_to_last_n_turns = SessionParser.trim_to_last_n_turns
-    trim_to_live_context = SessionParser.trim_to_live_context
-    count_lines_by_section = SessionParser.count_lines_by_section
-    to_markdown = SessionParser.to_markdown
+
+
+def _json_orchestration(item: Dict, filt: Dict, output_cap: int) -> Dict:
+    """Select stage layers explicitly so disabled content cannot leak through cached parts."""
+    result = {key: item[key] for key in (
+        'type', 'execution_id', 'tool_use_id', 'purpose', 'mode', 'crew_status',
+        'status_detail', 'failed_stage',
+    ) if key in item}
+    if not filt.get('statuses', {}).get(item.get('crew_status') or 'running', True):
+        result['filtered'] = True
+        return result
+    layers = filt.get('layers') or {}
+    if layers.get('shared_task'):
+        result['task'] = item.get('task') or ''
+    heavy = load_orchestration_heavy(item, filt, output_cap)
+    stages = []
+    for stage in item.get('stages') or []:
+        selected = {key: stage.get(key) for key in ('name', 'session_id', 'status', 'superseded')}
+        if filt.get('latest_only') and stage.get('superseded'):
+            if layers.get('roster') or layers.get('last_state'):
+                selected['body_omitted'] = True
+                stages.append(selected)
+            continue
+        if layers.get('roster'):
+            selected.update(role=stage.get('role') or '', model=stage.get('model') or '')
+        if layers.get('last_state'):
+            report = stage.get('report') or ''
+            if not report and stage.get('report_source') == 'utterance':
+                report = stage.get('utterance') or ''
+            selected['last_state'] = {'report': report, 'source': stage.get('report_source'),
+                                      'tool_counts': stage.get('tool_counts') or {}}
+        for layer in ('brief', 'talk', 'commands'):
+            if layers.get(layer):
+                selected[layer] = stage.get(layer) or ([] if layer == 'commands' else '')
+        for layer in ORCH_HEAVY_LAYERS:
+            if layers.get(layer):
+                selected[layer] = [cap_text(text, output_cap) for text in
+                                   heavy.get((stage.get('session_id') or '', layer), [])]
+        if any(layers.values()):
+            stages.append(selected)
+    result['stages'] = stages
+    return result
+
+
+def _render_options(section_filter, clean_content, output_cap, user_cap,
+                    agent_cap, reasoning_cap, summary_cap, orch_filter) -> ExportOptions:
+    sections = {key: True for key in ALL_SECTION_KEYS} if section_filter is None else section_filter
+    orch = default_orch_filter() if orch_filter is None else orch_filter
+    return ExportOptions(sections, clean_content, output_cap, user_cap,
+                         agent_cap, reasoning_cap, summary_cap, orch)
+
+
+def _render_context() -> RenderContext:
+    return RenderContext(guess_lang, strip_ide_context, load_orchestration_heavy,
+                         render_orchestration, _json_orchestration)
+
+
+def serialize_sessions_json(parsers, section_filter: Optional[Dict[str, bool]] = None,
+                            clean_content: bool = False, output_cap: int = 0,
+                            user_cap: int = 0, agent_cap: int = 0, reasoning_cap: int = 0,
+                            summary_cap: int = 0, orch_filter: Optional[Dict] = None) -> str:
+    """Compatibility entry point; rendering uses one named options object."""
+    options = _render_options(section_filter, clean_content, output_cap, user_cap,
+                              agent_cap, reasoning_cap, summary_cap, orch_filter)
+    return _serialize_sessions_json(parsers, options, _render_context())
 
 
 # ──────────────────────────────────────────────────────────────
@@ -3007,29 +2984,9 @@ def guess_lang(path: str) -> str:
 # the roster and each stage's last useful report. Command output, file
 # bodies, and reasoning stay behind filter rows that show their cost.
 # ──────────────────────────────────────────────────────────────
-ORCH_STATUSES = (
-    ('completed', 'Completed'),
-    ('cancelled', 'Cancelled'),
-    ('error', 'Error'),
-    ('running', 'Still running'),
-)
-# (key, label, default_on). Light layers are stored as text. Heavy layers
-# are counted during the scan and loaded only if the export turns them on.
-ORCH_LAYERS = (
-    ('last_state', 'Last state', True),
-    ('roster', 'Stage roster', True),
-    ('brief', 'Stage briefs', False),
-    ('shared_task', 'Shared task', False),
-    ('talk', 'Stage messages', False),
-    ('commands', 'Stage commands', False),
-    ('command_output', 'Stage command output', False),
-    ('reasoning', 'Stage reasoning', False),
-    ('file_read', 'Stage file reads', False),
-    ('file_write', 'Stage file writes', False),
-    ('search', 'Stage searches', False),
-)
+# Light layers are stored as text. Heavy layers are counted during the
+# scan and loaded only if the export turns them on.
 ORCH_LIGHT_LAYERS = ('last_state', 'roster', 'brief', 'shared_task', 'talk', 'commands')
-ORCH_HEAVY_LAYERS = ('command_output', 'reasoning', 'file_read', 'file_write', 'search')
 ORCH_HEAVY_TITLES = {
     'command_output': 'Command output',
     'reasoning': 'Reasoning',
@@ -3039,25 +2996,6 @@ ORCH_HEAVY_TITLES = {
 }
 _STAGE_NAME_RE = re.compile(r'YOUR STAGE:\s*([A-Za-z0-9_-]+)')
 _FAILED_STAGE_RE = re.compile(r"stage\s+'([^']+)'", re.IGNORECASE)
-
-
-def default_orch_filter() -> Dict:
-    return {
-        'statuses': {key: True for key, _label in ORCH_STATUSES},
-        'layers': {key: on for key, _label, on in ORCH_LAYERS},
-        'latest_only': False,
-    }
-
-
-def cap_text(text: str, cap: int) -> str:
-    """Keep the last `cap` lines. cap <= 0 keeps everything."""
-    if not text or cap <= 0:
-        return text or ''
-    lines = text.split('\n')
-    if len(lines) <= cap:
-        return text
-    kept = lines[-cap:]
-    return f"... ({len(lines) - cap} lines trimmed) ...\n" + '\n'.join(kept)
 
 
 def text_line_count(text: str) -> int:
@@ -4247,6 +4185,9 @@ def enrich_orchestrations(parser) -> None:
 
 def estimate_lines(item: Dict) -> int:
     t = item['type']
+    if item.get('result_only'):
+        output = item.get('output') or ''
+        return 3 + (output.count('\n') + 4 if output.strip() else 0)
     if t == 'orchestration':
         lines, _chars = orchestration_metrics(item, default_orch_filter(), 0)
         return lines
@@ -4283,7 +4224,8 @@ def estimate_lines(item: Dict) -> int:
         return 4 + (r.count('\n') + 2 if isinstance(r, str) and r.strip() else 0)
     if t == 'sub_agent':
         p = item.get('prompt', '') or item.get('response', '') or ''
-        return 4 + (p.count('\n') + 2 if isinstance(p, str) else 0)
+        nested = (item.get('sub_execution') or {}).get('events') or []
+        return 4 + (p.count('\n') + 2 if isinstance(p, str) else 0) + sum(estimate_lines(event) for event in nested)
     if t in ('intent', 'error', 'session_event', 'diagnostics'):
         return 2
     if t == 'user_input':
@@ -4374,7 +4316,6 @@ def read_key() -> str:
 # Interactive Section Filter
 # ──────────────────────────────────────────────────────────────
 OUTPUT_SECTIONS = {'terminal_output', 'process_ctrl', 'web_fetch', 'file_read'}
-CAP_STEPS = [0, 1, 2, 3, 4, 5, 6, 8, 10, 15, 20, 30, 50, 100, 200, 500]
 MSG_CAP_STEPS = [0, 5] + list(range(10, 101, 10)) + [150, 200, 300, 500]
 
 def _filter_row_specs() -> Tuple[List[Dict], int]:
@@ -4427,6 +4368,8 @@ def _item_export_chars(item: Dict, output_cap: int) -> int:
         value = item.get(key)
         if isinstance(value, str):
             chars += len(value)
+    for event in (item.get('sub_execution') or {}).get('events') or []:
+        chars += _item_export_chars(event, output_cap)
     return chars + 24
 
 
@@ -4758,7 +4701,44 @@ def render_filter_footer(cols: Dict, sel_lines: int, total_lines: int,
     return [rule, _filter_line(top), _filter_line(bottom)]
 
 
-def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> Tuple[Dict[str, bool], bool, int, int, int, int, int, Dict]:
+def get_default_export_options(preferences: Optional[Dict] = None) -> ExportOptions:
+    """Restore valid saved choices while supplying defaults for newly added sections."""
+    preferences = load_preferences() if preferences is None else preferences
+    saved = ExportOptions.from_dict(preferences.get('export_options', {}))
+    sections = {key: saved.sections.get(key, enabled) for key, _name, _emoji, enabled in SECTION_DEFS}
+    orch = default_orch_filter()
+    for group in ('statuses', 'layers'):
+        orch[group].update({key: value for key, value in saved.orch_filter.get(group, {}).items()
+                            if key in orch[group] and isinstance(value, bool)})
+    if isinstance(saved.orch_filter.get('latest_only'), bool):
+        orch['latest_only'] = saved.orch_filter['latest_only']
+    return ExportOptions(sections, saved.clean_content, saved.output_cap, saved.user_cap,
+                         saved.agent_cap, saved.reasoning_cap, saved.summary_cap, orch)
+
+
+def _saved_scope(preferences: Dict) -> Dict:
+    scope = preferences.get('scope') or {'mode': 'full'}
+    mode = scope.get('mode')
+    if mode == 'last':
+        return _last_scope(scope['n'])
+    if mode == 'first':
+        return _first_scope(scope['n'])
+    if mode == 'range':
+        return _range_scope(scope['start'], scope['end'])
+    return _live_scope() if mode == 'live' else _full_scope()
+
+
+def _saved_output_location(parsers, file_mode: str, preferences: Dict) -> Tuple[str, Path]:
+    script_dir = script_output_directory()
+    project_dirs = _project_dirs_from_parsers(parsers)
+    if preferences.get('output_location') == 'script' or not project_dirs:
+        return 'single', script_dir
+    if file_mode == 'separate' and len(project_dirs) > 1:
+        return 'per_project', script_dir
+    return 'single', project_dirs[0]
+
+
+def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> ExportOptions:
     _line_cache: Dict = {}
 
     def get_lines(cap_out, cap_user, cap_agent, cap_reason, cap_sum, orch_key):
@@ -4772,14 +4752,21 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
         _line_cache[key] = packed
         return packed
 
-    fstate: Dict[str, bool] = {s[0]: s[3] for s in SECTION_DEFS}
-    orch_filter = default_orch_filter()
-    clean_content = False
-    output_cap = 8;  cap_idx = CAP_STEPS.index(8)
-    user_cap = 0;    u_idx = 0
-    agent_cap = 0;   a_idx = 0
-    reason_cap = 0;  r_idx = 0
-    summary_cap = 0; s_idx = 0
+    saved = get_default_export_options()
+    fstate = saved.sections
+    orch_filter = saved.orch_filter
+    clean_content = saved.clean_content
+    output_cap, user_cap, agent_cap = saved.output_cap, saved.user_cap, saved.agent_cap
+    reason_cap, summary_cap = saved.reasoning_cap, saved.summary_cap
+
+    def cap_index(value, choices):
+        return max((i for i, choice in enumerate(choices) if choice <= value), default=0)
+
+    cap_idx = cap_index(output_cap, CAP_STEPS)
+    u_idx = cap_index(user_cap, MSG_CAP_STEPS)
+    a_idx = cap_index(agent_cap, MSG_CAP_STEPS)
+    r_idx = cap_index(reason_cap, MSG_CAP_STEPS)
+    s_idx = cap_index(summary_cap, MSG_CAP_STEPS)
 
     cursor = 0
     specs = FILTER_ROW_SPECS
@@ -4932,8 +4919,8 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
                     fstate[s[0]] = s[3]
                 _reset_orch()
                 clean_content = False
-                output_cap = 8
-                cap_idx = CAP_STEPS.index(8)
+                output_cap = DEFAULT_OUTPUT_CAP
+                cap_idx = CAP_STEPS.index(DEFAULT_OUTPUT_CAP)
                 user_cap = 0
                 u_idx = 0
                 agent_cap = 0
@@ -4952,6 +4939,8 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
                         for s in SECTION_DEFS:
                             fstate[s[0]] = s[3]
                         _reset_orch()
+                        output_cap = DEFAULT_OUTPUT_CAP
+                        cap_idx = CAP_STEPS.index(DEFAULT_OUTPUT_CAP)
                     else:
                         for s in SECTION_DEFS:
                             fstate[s[0]] = s[0] in pkeys
@@ -4959,7 +4948,8 @@ def interactive_filter(parsers: List[SessionParser], scope_label: str = "") -> T
     finally:
         sys.stdout.write('\033[?25h\033[?1049l')
         sys.stdout.flush()
-    return fstate, clean_content, output_cap, user_cap, agent_cap, reason_cap, summary_cap, orch_filter
+    return ExportOptions(fstate, clean_content, output_cap, user_cap, agent_cap,
+                         reason_cap, summary_cap, orch_filter)
 
 # ──────────────────────────────────────────────────────────────
 # Turn scope
@@ -5053,6 +5043,13 @@ def live_context_items(data: List[Dict]) -> List[Dict]:
 def apply_extraction_scope(parser, scope: Dict) -> None:
     """Replace parser.data with the chosen turns. Full scope leaves it alone."""
     mode = (scope or {}).get('mode') or 'full'
+    if not hasattr(parser, 'source_turn_count'):
+        parser.source_turn_count = parser.get_turn_count()
+        parser.source_event_count = len(parser.data)
+        parser.source_read_error_count = _session_read_error_count(parser.data)
+    # A later request for full scope cannot restore data already removed.
+    if mode != 'full' or not hasattr(parser, 'extraction_scope'):
+        parser.extraction_scope = _json_value(scope or _full_scope())
     if mode == 'full':
         return
     count = len(turn_boundaries(parser.data))
@@ -5437,6 +5434,22 @@ def open_in_file_explorer(path: Path) -> Tuple[bool, Optional[Path]]:
         return False, None
 
 
+def write_export_file(path: Path, content: str) -> Path:
+    """Create a new export, suffixing collisions without replacing an earlier file."""
+    candidate = path
+    number = 2
+    while True:
+        try:
+            stream = candidate.open('x', encoding='utf-8', newline='')
+        except FileExistsError:
+            candidate = path.with_name(f'{path.stem}_{number}{path.suffix}')
+            number += 1
+            continue
+        with stream:
+            stream.write(content)
+        return candidate
+
+
 def combine_parsers_to_markdown(parsers: List['SessionParser'],
                                 section_filter: Dict[str, bool],
                                 clean_content: bool,
@@ -5521,6 +5534,32 @@ def combine_parsers_to_markdown(parsers: List['SessionParser'],
     return '\n'.join(parts), filename
 
 
+def combine_parsers_to_json(parsers, section_filter, clean_content, output_cap,
+                            user_cap, agent_cap, reasoning_cap, summary_cap,
+                            orch_filter=None) -> Tuple[str, str]:
+    text = serialize_sessions_json(parsers, section_filter, clean_content, output_cap,
+                                   user_cap, agent_cap, reasoning_cap, summary_cap, orch_filter)
+    date = datetime.fromtimestamp(max((p.date_created or 0) for p in parsers) / 1000).strftime('%Y%m%d')
+    filename = f'{date}_combined-{len(parsers)}_{clean_filename(parsers[0].title)}.json'
+    return text, filename
+
+
+def select_export_format() -> str:
+    default = load_preferences()['format']
+    while True:
+        print(f"\n  {Style.BOLD}Export Format:{Style.RESET}")
+        print(f"    {Style.YELLOW}[M]{Style.RESET}arkdown (.md)" + (f"  {Style.DIM}[Default]{Style.RESET}" if default == 'markdown' else ''))
+        print(f"    {Style.YELLOW}[J]{Style.RESET}SON (.json)" + (f"  {Style.DIM}[Default]{Style.RESET}" if default == 'json' else ''))
+        choice = input(f"\n  {Style.BOLD}Select > {Style.RESET}").strip().lower()
+        if not choice:
+            return default
+        if choice in ('m', 'md', 'markdown'):
+            return 'markdown'
+        if choice in ('j', 'json'):
+            return 'json'
+        print(Style.warn('Please choose M or J.'))
+
+
 def maybe_open_directory(written_paths: List[Path]):
     """Ask whether to open the folder where the files were saved. Always
     opens the saved-file's directory directly (no Explorer /select trick)
@@ -5585,58 +5624,29 @@ def _project_dirs_from_parsers(parsers: List['SessionParser']) -> List[Path]:
 
 
 def choose_output_location(parsers: List['SessionParser'], file_mode: str) -> Tuple[str, Path]:
-    """Return ('single'|'per_project', directory).
-
-    If selected session project dir and script dir are the same, no prompt.
-    For multiple workspaces and separate files, the user may save each file
-    next to its own project; combined exports use one chosen directory.
-    """
+    """Choose a destination using the last successful location as the Enter default."""
     script_dir = script_output_directory()
-    project_dirs = _project_dirs_from_parsers(parsers)
-    if not project_dirs:
+    projects = _project_dirs_from_parsers(parsers)
+    if not projects:
         return 'single', script_dir
-
-    if len(project_dirs) == 1:
-        project_dir = project_dirs[0]
-        if _norm_ws_path(str(project_dir)) == _norm_ws_path(str(script_dir)):
-            return 'single', script_dir
-        while True:
-            print(f"\n  {Style.BOLD}Save Markdown file(s) where?{Style.RESET}")
-            print(f"    {Style.YELLOW}[P]{Style.RESET}roject directory  {Style.DIM}{project_dir}{Style.RESET}  {Style.DIM}[Default]{Style.RESET}")
-            print(f"    {Style.YELLOW}[S]{Style.RESET}cript directory   {Style.DIM}{script_dir}{Style.RESET}")
-            ans = input(f"\n  {Style.BOLD}Select > {Style.RESET}").strip().lower() or 'p'
-            if ans in ('p', 'project', 'workspace'):
-                return 'single', project_dir
-            if ans in ('s', 'script'):
-                return 'single', script_dir
-            print(f"  {Style.warn(f'Unrecognised input {ans!r}. Please type P or S.')}")
-
-    if file_mode == 'separate':
-        while True:
-            print(f"\n  {Style.BOLD}Save Markdown files where?{Style.RESET}")
-            print(f"    {Style.YELLOW}[P]{Style.RESET}roject directories  {Style.DIM}(each session saved in its own workspace){Style.RESET}  {Style.DIM}[Default]{Style.RESET}")
-            print(f"    {Style.YELLOW}[S]{Style.RESET}cript directory     {Style.DIM}{script_dir}{Style.RESET}")
-            ans = input(f"\n  {Style.BOLD}Select > {Style.RESET}").strip().lower() or 'p'
-            if ans in ('p', 'project', 'projects', 'workspace', 'workspaces'):
-                return 'per_project', script_dir
-            if ans in ('s', 'script'):
-                return 'single', script_dir
-            print(f"  {Style.warn(f'Unrecognised input {ans!r}. Please type P or S.')}")
-
-    first_project = project_dirs[0]
-    if _norm_ws_path(str(first_project)) == _norm_ws_path(str(script_dir)):
+    per_project = len(projects) > 1 and file_mode == 'separate'
+    if not per_project and _norm_ws_path(str(projects[0])) == _norm_ws_path(str(script_dir)):
         return 'single', script_dir
+    default = 's' if load_preferences()['output_location'] == 'script' else 'p'
+    project_label = 'Project directories (one per workspace)' if per_project else f'Project directory: {projects[0]}'
     while True:
-        print(f"\n  {Style.BOLD}Save combined Markdown file where?{Style.RESET}")
-        print(f"    {Style.YELLOW}[P]{Style.RESET}roject directory  {Style.DIM}{first_project}{Style.RESET}  {Style.DIM}[Default]{Style.RESET}")
-        print(f"    {Style.YELLOW}[S]{Style.RESET}cript directory   {Style.DIM}{script_dir}{Style.RESET}")
-        print(f"    {Style.DIM}Multiple project directories were selected; project means the first selected session's workspace.{Style.RESET}")
-        ans = input(f"\n  {Style.BOLD}Select > {Style.RESET}").strip().lower() or 'p'
-        if ans in ('p', 'project', 'workspace'):
-            return 'single', first_project
-        if ans in ('s', 'script'):
+        print(f"\n  {Style.BOLD}Save export file(s) where?{Style.RESET}")
+        for key, label in (('p', project_label), ('s', f'Script directory: {script_dir}')):
+            badge = f"  {Style.DIM}[Default]{Style.RESET}" if key == default else ''
+            print(f"    {Style.YELLOW}[{key.upper()}]{Style.RESET} {label}{badge}")
+        if len(projects) > 1 and not per_project:
+            print(f"    {Style.DIM}Combined exports use the first selected session's workspace.{Style.RESET}")
+        answer = input(f"\n  {Style.BOLD}Select > {Style.RESET}").strip().lower() or default
+        if answer in ('p', 'project', 'projects', 'workspace', 'workspaces'):
+            return ('per_project', script_dir) if per_project else ('single', projects[0])
+        if answer in ('s', 'script'):
             return 'single', script_dir
-        print(f"  {Style.warn(f'Unrecognised input {ans!r}. Please type P or S.')}")
+        print(Style.warn('Please type P or S.'))
 
 
 def output_path_for_parser(parser: 'SessionParser', filename: str,
@@ -6166,7 +6176,12 @@ def _parse_sessions_parallel(entries: List['SessionEntry'], max_workers: int = 6
     def _parse_one(idx_entry):
         idx, entry = idx_entry
         try:
-            return idx, parser_cls(entry)
+            parser = parser_cls(entry)
+            read_errors = _session_read_error_count(parser.data)
+            if read_errors:
+                print(Style.warn(f"Session {entry.session_id[:8]}: {read_errors} read error(s). "
+                                 "Enable Errors in the section filter to include details."))
+            return idx, parser
         except Exception as e:
             print(Style.error(f"Failed to parse {entry.session_id[:8]}: {e}"))
             return idx, None
@@ -6291,27 +6306,27 @@ def process_chain_export(chain: 'Chain'):
     if not parsers:
         return
     # Reuse the interactive filter UI so options match per-session export
-    section_filter, clean_content, output_cap, user_cap, agent_cap, reason_cap, summary_cap, orch_filter = interactive_filter(
-        parsers, scope_label=f"chain {chain.id}"
-    )
-    if not any(section_filter.values()):
+    preferences = load_preferences()
+    options = (get_default_export_options(preferences) if _REUSE_EXPORT_SETTINGS else
+               ExportOptions.from_legacy(interactive_filter(parsers, scope_label=f"chain {chain.id}")))
+    if not any(options.sections.values()):
         print(Style.warn("Nothing selected — skipping export."))
         input(f"\n{Style.DIM}Press Enter to continue...{Style.RESET}")
         return
 
-    md, fname = merge_chain_to_markdown(
-        chain, section_filter, clean_content, output_cap, orch_filter,
-        user_cap=user_cap, agent_cap=agent_cap,
-        reasoning_cap=reason_cap, summary_cap=summary_cap,
-    )
-    _mode, out_dir = choose_output_location(parsers, file_mode='combined')
-    out_path = out_dir / fname
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write(md)
-    print(f"  {Style.GREEN}➜{Style.RESET} Saved: {fname}  "
+    export_format = preferences['format'] if _REUSE_EXPORT_SETTINGS else select_export_format()
+    if export_format == 'json':
+        md, fname = combine_parsers_to_json(parsers, *options.legacy_tuple())
+    else:
+        md, fname = merge_chain_to_markdown(chain, **options.render_kwargs())
+    _mode, out_dir = (_saved_output_location(parsers, 'combined', preferences) if _REUSE_EXPORT_SETTINGS
+                      else choose_output_location(parsers, file_mode='combined'))
+    out_path = write_export_file(out_dir / fname, md)
+    print(f"  {Style.GREEN}➜{Style.RESET} Saved: {out_path.name}  "
           f"{Style.CYAN}({md.count(chr(10))+1:,} lines){Style.RESET}")
-    maybe_open_directory([out_path])
-    input(f"\n{Style.DIM}Press Enter to continue...{Style.RESET}")
+    if not _REUSE_EXPORT_SETTINGS:
+        maybe_open_directory([out_path])
+        input(f"\n{Style.DIM}Press Enter to continue...{Style.RESET}")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -6341,46 +6356,49 @@ def process_conversion(indices_str: str, sessions: List[SessionEntry],
     if not parsers:
         return
 
-    scope_label = ""
+    preferences = load_preferences()
+    reuse = _REUSE_EXPORT_SETTINGS
+    scope = _full_scope()
     if allow_scope:
-        scope = select_extraction_scope(parsers)
+        scope = _saved_scope(preferences) if reuse else select_extraction_scope(parsers)
         if scope.get('mode') != 'full':
             for p in parsers:
                 apply_extraction_scope(p, scope)
-        scope_label = scope.get('label') or ''
+    options = (get_default_export_options(preferences) if reuse else
+               ExportOptions.from_legacy(interactive_filter(parsers, scope_label=scope.get('label') or '')))
 
-    section_filter, clean_content, output_cap, user_cap, agent_cap, reason_cap, summary_cap, orch_filter = \
-        interactive_filter(parsers, scope_label=scope_label)
-
-    if not any(section_filter.values()):
+    if not any(options.sections.values()):
         print(Style.warn("Nothing selected — skipping export."))
         input(f"\n{Style.DIM}Press Enter to return to menu...{Style.RESET}")
         return
 
     _clear_screen()
-    dest = ''
+    export_format = preferences['format'] if reuse else select_export_format()
+    dest = preferences['destination'] if reuse else ''
+    if reuse:
+        print(Style.info(f"Using saved settings: {export_format}, {scope.get('label', 'full session')}. Use U in the session browser to customize."))
     while dest not in ('f', 'c', 'b'):
         print(f"\n  {Style.BOLD}Export Destination:{Style.RESET}")
-        print(f"    {Style.YELLOW}[F]{Style.RESET}ile (save to disk)       {Style.DIM}[Default]{Style.RESET}")
-        print(f"    {Style.YELLOW}[C]{Style.RESET}lipboard (copy directly)")
-        print(f"    {Style.YELLOW}[B]{Style.RESET}oth")
-        dest = input(f"\n  {Style.BOLD}Select > {Style.RESET}").strip().lower() or 'f'
+        for key, label in (('f', 'File (save to disk)'), ('c', 'Clipboard (copy directly)'), ('b', 'Both')):
+            badge = f"  {Style.DIM}[Default]{Style.RESET}" if key == preferences['destination'] else ''
+            print(f"    {Style.YELLOW}[{key.upper()}]{Style.RESET}{label}{badge}")
+        dest = input(f"\n  {Style.BOLD}Select > {Style.RESET}").strip().lower() or preferences['destination']
 
     # If we'll write files AND more than one session was selected, ask whether
     # to merge them into one file or keep them separate.
-    file_mode = 'separate'  # default for single-session
-    if dest in ('f', 'b') and len(parsers) > 1:
+    file_mode = preferences['file_mode']
+    if not reuse and dest in ('f', 'b') and len(parsers) > 1:
         # Accept any reasonable phrasing of either option. The visual `[O]ne`
         # easily reads as `[0]ne`, so both `0` and `o` are valid for combined.
         COMBINED_INPUTS = {'o', '0', 'one', 'combined', 'combine', 'c', '1', 'merge', 'merged'}
         SEPARATE_INPUTS = {'s', 'sep', 'separate', '2'}
         while True:
             print(f"\n  {Style.BOLD}{len(parsers)} sessions selected — save as:{Style.RESET}")
-            print(f"    {Style.YELLOW}[O]{Style.RESET}ne combined file  {Style.DIM}(merged with section dividers){Style.RESET}")
-            print(f"    {Style.YELLOW}[S]{Style.RESET}eparate files     {Style.DIM}(one per session) [Default]{Style.RESET}")
+            print(f"    {Style.YELLOW}[O]{Style.RESET}ne combined file" + (' [Default]' if preferences['file_mode'] == 'combined' else ''))
+            print(f"    {Style.YELLOW}[S]{Style.RESET}eparate files" + (' [Default]' if preferences['file_mode'] == 'separate' else ''))
             ans = input(f"\n  {Style.BOLD}Select > {Style.RESET}").strip().lower()
             if ans == '':
-                file_mode = 'separate'
+                file_mode = preferences['file_mode']
                 break
             if ans in COMBINED_INPUTS:
                 file_mode = 'combined'; break
@@ -6395,24 +6413,22 @@ def process_conversion(indices_str: str, sessions: List[SessionEntry],
 
     output_mode, out_dir = ('single', script_output_directory())
     if dest in ('f', 'b'):
-        output_mode, out_dir = choose_output_location(parsers, file_mode)
+        output_mode, out_dir = (_saved_output_location(parsers, file_mode, preferences) if reuse
+                                else choose_output_location(parsers, file_mode))
 
     print(f"\n{Style.info(f'Processing {len(parsers)} session(s)...')}")
 
     written_paths: List[Path] = []
     clipboard_md: List[str] = []
+    copy_succeeded = False
 
     if dest in ('f', 'b') and file_mode == 'combined' and len(parsers) > 1:
         # One merged document
         try:
-            combined_md, combined_fname = combine_parsers_to_markdown(
-                parsers, section_filter, clean_content, output_cap,
-                user_cap, agent_cap, reason_cap, summary_cap, orch_filter,
-            )
-            out_path = out_dir / combined_fname
-            with open(out_path, 'w', encoding='utf-8') as f:
-                f.write(combined_md)
-            print(f"  {Style.GREEN}➜{Style.RESET} Saved combined: {combined_fname}  "
+            combine = combine_parsers_to_json if export_format == 'json' else combine_parsers_to_markdown
+            combined_md, combined_fname = combine(parsers, *options.legacy_tuple())
+            out_path = write_export_file(out_dir / combined_fname, combined_md)
+            print(f"  {Style.GREEN}➜{Style.RESET} Saved combined: {out_path.name}  "
                   f"{Style.CYAN}({combined_md.count(chr(10))+1:,} lines){Style.RESET}")
             written_paths.append(out_path)
             if dest in ('c', 'b'):
@@ -6423,51 +6439,61 @@ def process_conversion(indices_str: str, sessions: List[SessionEntry],
         # Separate files (or single-session)
         for parser in parsers:
             try:
-                md_content = parser.to_markdown(
-                    section_filter=section_filter,
-                    clean_content=clean_content,
-                    output_cap=output_cap,
-                    user_cap=user_cap,
-                    agent_cap=agent_cap,
-                    reasoning_cap=reason_cap,
-                    summary_cap=summary_cap,
-                    orch_filter=orch_filter,
-                )
+                render = parser.to_json if export_format == 'json' else parser.to_markdown
+                md_content = render(**options.render_kwargs())
                 try:
                     date_prefix = datetime.fromtimestamp((parser.date_created or 0) / 1000.0).strftime("%Y%m%d")
                 except Exception:
                     date_prefix = datetime.now().strftime("%Y%m%d")
                 safe_title = clean_filename(parser.title)
-                out_filename = f"{date_prefix}_{safe_title}.md"
+                out_filename = (f"{date_prefix}_{safe_title}_{clean_filename(parser.session_id)}.json"
+                                if export_format == 'json' else f"{date_prefix}_{safe_title}.md")
                 line_count = md_content.count('\n') + 1
 
                 if dest in ('c', 'b'):
-                    if len(parsers) > 1:
+                    if len(parsers) > 1 and export_format != 'json':
                         clipboard_md.append(f"<!-- Session: {out_filename} -->\n" + md_content)
                     else:
                         clipboard_md.append(md_content)
                 if dest in ('f', 'b'):
-                    out_path = output_path_for_parser(parser, out_filename, output_mode, out_dir)
-                    with open(out_path, 'w', encoding='utf-8') as f:
-                        f.write(md_content)
-                    print(f"  {Style.GREEN}➜{Style.RESET} Saved: {out_filename}  "
+                    out_path = write_export_file(
+                        output_path_for_parser(parser, out_filename, output_mode, out_dir), md_content)
+                    print(f"  {Style.GREEN}➜{Style.RESET} Saved: {out_path.name}  "
                           f"{Style.CYAN}({line_count:,} lines){Style.RESET}")
                     written_paths.append(out_path)
             except Exception as e:
                 print(f"  {Style.error(f'Failed {parser.session_id[:8]}: {e}')}")
 
     if dest in ('c', 'b') and clipboard_md:
-        text = "\n\n---\n\n".join(clipboard_md)
+        if export_format == 'json':
+            documents = [json.loads(text) for text in clipboard_md]
+            document = documents[0]
+            document['sessions'] = [session for item in documents for session in item['sessions']]
+            text = json.dumps(document, ensure_ascii=False, indent=2, allow_nan=False) + '\n'
+        else:
+            text = "\n\n---\n\n".join(clipboard_md)
         if copy_to_clipboard(text):
+            copy_succeeded = True
             print(f"  {Style.GREEN}➜{Style.RESET} Copied to clipboard! "
                   f"{Style.CYAN}({text.count(chr(10)):,} total lines){Style.RESET}")
         else:
             print(f"  {Style.RED}➜{Style.RESET} Failed to copy to clipboard.")
 
-    if written_paths:
+    if written_paths or copy_succeeded:
+        location = preferences['output_location']
+        if dest in ('f', 'b'):
+            location = ('script' if output_mode == 'single' and
+                        _norm_ws_path(str(out_dir)) == _norm_ws_path(str(script_output_directory())) else 'project')
+        choices = {'source': 'cli' if parsers[0].metadata.get('source') == 'Kiro CLI' else 'ide',
+                   'format': export_format, 'destination': dest, 'file_mode': file_mode,
+                   'output_location': location, 'scope': scope, 'export_options': options.as_dict()}
+        if not save_preferences(choices):
+            print(Style.warn('Export completed, but its settings could not be saved.'))
+    if written_paths and not reuse:
         maybe_open_directory(written_paths)
 
-    input(f"\n{Style.DIM}Press Enter to return to menu...{Style.RESET}")
+    if not reuse:
+        input(f"\n{Style.DIM}Press Enter to return to menu...{Style.RESET}")
 
 
 def _find_entries_by_session_id(entries: List[SessionEntry], query: str) -> List[SessionEntry]:
@@ -6509,7 +6535,7 @@ def interactive_find_session_by_id():
     from concurrent.futures import ThreadPoolExecutor
 
     def _scan_ide():
-        return scan_all_sessions() if WORKSPACE_SESSIONS_DIR.exists() else []
+        return scan_all_sessions()
 
     def _scan_cli():
         if not KIRO_CLI_SESSIONS_DIR.exists():
@@ -6587,11 +6613,11 @@ def interactive_find_session_by_id():
 # Interactive main loop
 # ──────────────────────────────────────────────────────────────
 def interactive_loop_ide():
-    global EXEC_INDEX, CHAIN_GRAPH
-    if not WORKSPACE_SESSIONS_DIR.exists():
-        print(Style.error(f"Workspace-sessions folder not found: {WORKSPACE_SESSIONS_DIR}"))
-        print(Style.info("Set KIRO_HOME env var if Kiro stores data elsewhere."))
-        sys.exit(1)
+    global EXEC_INDEX, CHAIN_GRAPH, _REUSE_EXPORT_SETTINGS
+    if not WORKSPACE_SESSIONS_DIR.exists() and not KIRO_IDE_SESSIONS_DIR.exists():
+        print(Style.error(f"IDE session folders not found: {KIRO_IDE_SESSIONS_DIR}; {WORKSPACE_SESSIONS_DIR}"))
+        print(Style.info("Set KIRO_IDE_SESSIONS_DIR (modern IDE) or KIRO_HOME (legacy IDE)."))
+        return
 
     print(f"{Style.DIM}Scanning Kiro storage...{Style.RESET}")
     EXEC_INDEX = ExecutionIndex(KIRO_HOME)
@@ -6599,15 +6625,17 @@ def interactive_loop_ide():
 
     all_sessions_full = scan_all_sessions()
     if not all_sessions_full:
-        print(Style.error("No sessions found.")); sys.exit(1)
+        print(Style.error("No IDE sessions found in the modern or legacy storage folders."))
+        input(f"\n{Style.DIM}Press Enter to return to source menu...{Style.RESET}")
+        return
 
     CHAIN_GRAPH = ChainGraph(all_sessions_full, EXEC_INDEX)
 
-    # Scope to the launch directory — that exact directory and nothing else.
+    # Match the launch workspace; otherwise show the available sessions.
     CWD = current_dir()
     cwd_match = detect_workspace_from_cwd(all_sessions_full)
     cwd_parent = nearest_parent_workspace(all_sessions_full)
-    workspace_filter: Optional[str] = cwd_match or CWD
+    workspace_filter: Optional[str] = cwd_match
     show_hidden = False
     show_preview = False
     sort_key = 'date'
@@ -6628,7 +6656,8 @@ def interactive_loop_ide():
 
     while True:
         sessions = current_sessions()
-        print_menu_header(workspace_filter, len(all_sessions_full), total_workspaces, cwd_match)
+        print_menu_header(workspace_filter, len(all_sessions_full), total_workspaces, cwd_match,
+                          storage_path=KIRO_IDE_SESSIONS_DIR if KIRO_IDE_SESSIONS_DIR.exists() else KIRO_HOME)
 
         scoped_to_empty_cwd = (workspace_filter == CWD and cwd_match is None)
         multi_chains = [c for c in CHAIN_GRAPH.chains.values() if c.length > 1]
@@ -6667,6 +6696,7 @@ def interactive_loop_ide():
                     print(f"{Style.DIM}(Showing {view_limit} of {len(sessions)} sessions — press M for more){Style.RESET}")
 
         print(f"\n{Style.BOLD}OPTIONS:{Style.RESET}")
+        print(f"  {Style.CYAN}[u]{Style.RESET}      : Reuse saved export settings ({'ON' if _REUSE_EXPORT_SETTINGS else 'OFF'})")
         # Workspace switching surfaced FIRST since it's how you find your sessions.
         print(f"  {Style.CYAN}[w]{Style.RESET}      : Switch workspace  "
               f"{Style.DIM}(or {Style.RESET}{Style.YELLOW}w1{Style.RESET}{Style.DIM}, {Style.RESET}{Style.YELLOW}w2{Style.RESET}{Style.DIM}, …  to jump directly){Style.RESET}")
@@ -6687,7 +6717,10 @@ def interactive_loop_ide():
         print(f"  {Style.RED}[q]{Style.RESET}      : Quit")
         choice = input(f"\n{Style.BOLD}Select > {Style.RESET}").strip().lower()
 
-        if choice == 'q':
+        if choice == 'u':
+            _REUSE_EXPORT_SETTINGS = not _REUSE_EXPORT_SETTINGS
+            continue
+        elif choice == 'q':
             print('Bye.'); sys.exit(0)
         elif choice == 'w':
             ws = select_workspace(all_sessions_full, workspace_filter)
@@ -6739,7 +6772,7 @@ def interactive_loop_ide():
 
 
 def interactive_loop_cli():
-    global EXEC_INDEX, CHAIN_GRAPH
+    global EXEC_INDEX, CHAIN_GRAPH, _REUSE_EXPORT_SETTINGS
     EXEC_INDEX = None
     CHAIN_GRAPH = None
 
@@ -6753,12 +6786,11 @@ def interactive_loop_cli():
     if not all_sessions_full:
         print(Style.error("No Kiro CLI sessions found.")); sys.exit(1)
 
-    # Scope to the directory we were launched from — that exact directory and
-    # nothing else. A parent workspace is only ever offered, never applied.
+    # Match the launch workspace; otherwise show the available sessions.
     CWD = current_dir()
     cwd_match = detect_workspace_from_cwd(all_sessions_full)
     cwd_parent = nearest_parent_workspace(all_sessions_full)
-    workspace_filter: Optional[str] = cwd_match or CWD
+    workspace_filter: Optional[str] = cwd_match
     show_empty_helpers = False
     show_preview = False
     sort_key = 'date'
@@ -6812,6 +6844,7 @@ def interactive_loop_cli():
                 print(f"{Style.DIM}(Showing {view_limit} of {len(sessions)} sessions — press M for more){Style.RESET}")
 
         print(f"\n{Style.BOLD}OPTIONS:{Style.RESET}")
+        print(f"  {Style.CYAN}[u]{Style.RESET}      : Reuse saved export settings ({'ON' if _REUSE_EXPORT_SETTINGS else 'OFF'})")
         print(f"  {Style.CYAN}[w]{Style.RESET}      : Switch directory  "
               f"{Style.DIM}(or {Style.RESET}{Style.YELLOW}w1{Style.RESET}{Style.DIM}, {Style.RESET}{Style.YELLOW}w2{Style.RESET}{Style.DIM}, …  to jump directly){Style.RESET}")
         print(f"  {Style.CYAN}[x]{Style.RESET}      : Show ALL directories (clear filter)")
@@ -6828,7 +6861,10 @@ def interactive_loop_cli():
         print(f"  {Style.RED}[q]{Style.RESET}      : Quit")
         choice = input(f"\n{Style.BOLD}Select > {Style.RESET}").strip().lower()
 
-        if choice == 'q':
+        if choice == 'u':
+            _REUSE_EXPORT_SETTINGS = not _REUSE_EXPORT_SETTINGS
+            continue
+        elif choice == 'q':
             print('Bye.'); sys.exit(0)
         elif choice == 'w':
             ws = select_workspace(base_sessions, workspace_filter)
@@ -6874,20 +6910,26 @@ def interactive_loop_cli():
 
 
 def select_session_source() -> str:
-    default_source = 'cli' if KIRO_CLI_SESSIONS_DIR.exists() else 'ide'
+    global _REUSE_EXPORT_SETTINGS
+    default_source = load_preferences()['source']
     while True:
         _clear_screen()
         print(f"\n{Style.BOLD}KIRO SESSION MANAGER{Style.RESET}  {Style.DIM}choose session source{Style.RESET}\n")
         ide_default = f" {Style.DIM}[Default]{Style.RESET}" if default_source == 'ide' else ''
         cli_default = f" {Style.DIM}[Default]{Style.RESET}" if default_source == 'cli' else ''
         print(f"  {Style.YELLOW}[1]{Style.RESET} Kiro IDE sessions{ide_default}")
-        print(f"      {Style.DIM}{WORKSPACE_SESSIONS_DIR}{Style.RESET}")
+        print(f"      {Style.DIM}{KIRO_IDE_SESSIONS_DIR}{Style.RESET}")
+        print(f"      {Style.DIM}Legacy: {WORKSPACE_SESSIONS_DIR}{Style.RESET}")
         print(f"  {Style.YELLOW}[2]{Style.RESET} Kiro CLI sessions{cli_default}")
         print(f"      {Style.DIM}{KIRO_CLI_SESSIONS_DIR}{Style.RESET}")
         print(f"  {Style.YELLOW}[3]{Style.RESET} Find by session ID")
         print(f"      {Style.DIM}Search IDE and CLI stores in parallel{Style.RESET}")
+        print(f"  {Style.YELLOW}[r]{Style.RESET} Use saved export settings ({default_source.upper()})")
         print(f"  {Style.RED}[q]{Style.RESET} Quit")
         choice = input(f"\n{Style.BOLD}Select source > {Style.RESET}").strip().lower()
+        _REUSE_EXPORT_SETTINGS = choice in ('r', 'reuse')
+        if _REUSE_EXPORT_SETTINGS:
+            return default_source
         if not choice:
             return default_source
         if choice in ('1', 'i', 'ide', 'kiro ide'):
@@ -6910,8 +6952,22 @@ def interactive_loop():
         else:
             interactive_loop_ide()
 
-if __name__ == "__main__":
+def main(argv=None) -> int:
+    from kiro_export.cli import run_cli
+    result = run_cli(sys.modules[__name__], argv)
+    if result is not None:
+        return result
+    # Piped input cannot operate the raw-key filter screen. Explicit CLI commands
+    # remain usable from scripts and schedulers.
+    if not sys.stdin.isatty():
+        print('Use "list" or "export" for non-interactive operation. Run with --help for commands.', file=sys.stderr)
+        return 2
     try:
         interactive_loop()
     except KeyboardInterrupt:
-        print("\nCancelled."); sys.exit(0)
+        print("\nCancelled.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
