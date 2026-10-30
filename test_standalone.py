@@ -44,6 +44,21 @@ class StandaloneBuilderTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertEqual('standalone:from-options-from-sections', result.stdout.strip())
 
+    def test_bundle_uses_ascii_source_without_losing_unicode(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as run_dir:
+            root = Path(source_dir)
+            self.make_project(root)
+            (root / 'kiro_export' / 'options.py').write_text("VALUE = '你好 🌏'\n", encoding='utf-8')
+            bundle = build_standalone.build_source(root)
+            self.assertTrue(bundle.isascii())
+            script = Path(run_dir) / 'kiro-md.py'
+            script.write_text(bundle, encoding='utf-8')
+            result = subprocess.run([sys.executable, str(script)], cwd=run_dir,
+                                    encoding='utf-8', capture_output=True,
+                                    env={**os.environ, 'PYTHONIOENCODING': 'utf-8'})
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn('你好 🌏', result.stdout)
+
     def test_standalone_reuses_temporary_settings_and_explicit_scope_wins(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

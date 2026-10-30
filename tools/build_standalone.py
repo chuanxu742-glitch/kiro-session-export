@@ -34,12 +34,14 @@ def build_source(project_root=ROOT):
             f'_standalone_module.__package__ = "kiro_export"',
             f'_standalone_sys.modules[{module_name!r}] = _standalone_module',
             f'setattr(_standalone_package, {name!r}, _standalone_module)',
-            f'exec(compile({source!r}, {("<" + module_name + ">")!r}, "exec"), '
+            f'exec(compile({source!a}, {("<" + module_name + ">")!r}, "exec"), '
             '_standalone_module.__dict__)',
         ])
     lines.extend([
         '# The original entry point runs in this script\'s normal __main__ globals.',
-        'exec(compile(' + repr(entry_source) + ', "<kiro-md.py>", "exec"), globals())',
+        # ASCII escapes preserve Unicode while keeping long embedded source
+        # literals readable by older Python tokenizers.
+        'exec(compile(' + ascii(entry_source) + ', "<kiro-md.py>", "exec"), globals())',
         '',
     ])
     return '\n'.join(lines)
